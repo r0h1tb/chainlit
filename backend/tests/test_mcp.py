@@ -10,6 +10,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from starlette.requests import Request
 
 from chainlit.auth import get_current_user
 from chainlit.mcp import (
@@ -788,6 +789,25 @@ class TestDestinationOnOriginHook:
 # ── /mcp (connect_mcp) endpoint tests ──────────────────────────────────────
 
 
+def _mcp_http_request() -> Request:
+    """A bare ``POST /mcp`` request for tests that call connect_mcp directly.
+
+    connect_mcp takes the Request to build the MCP OAuth callback URL.
+    """
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "scheme": "http",
+            "server": ("testserver", 80),
+            "path": "/mcp",
+            "root_path": "",
+            "query_string": b"",
+            "headers": [],
+        }
+    )
+
+
 @pytest.fixture
 def mcp_chainlit_app():
     """Return chainlit.server.app.
@@ -890,6 +910,7 @@ def mock_mcp_transport(monkeypatch: pytest.MonkeyPatch):
     async def fake_sse_client(url, headers=None, httpx_client_factory=None, **kwargs):
         captured["url"] = url
         captured["httpx_client_factory"] = httpx_client_factory
+        captured["auth"] = kwargs.get("auth")
         yield (AsyncMock(), AsyncMock())
 
     @asynccontextmanager
@@ -898,6 +919,7 @@ def mock_mcp_transport(monkeypatch: pytest.MonkeyPatch):
     ):
         captured["url"] = url
         captured["httpx_client_factory"] = httpx_client_factory
+        captured["auth"] = kwargs.get("auth")
         yield (AsyncMock(), AsyncMock(), AsyncMock())
 
     monkeypatch.setattr("mcp.client.sse.sse_client", fake_sse_client)
@@ -1596,12 +1618,16 @@ class TestConnectMcpConcurrentReconnects:
             # while evicting old_session) before firing the second
             # concurrent reconnect for the same name.
             await reached_disconnect.wait()
-            resp = await connect_mcp(payload=payload, current_user=None)
+            resp = await connect_mcp(
+                request=_mcp_http_request(), payload=payload, current_user=None
+            )
             b_session = mcp_session_get_by_id_patched.mcp_sessions.get("custom")
             release_disconnect.set()
             return resp, b_session
 
-        task_a = asyncio.create_task(connect_mcp(payload=payload, current_user=None))
+        task_a = asyncio.create_task(
+            connect_mcp(request=_mcp_http_request(), payload=payload, current_user=None)
+        )
         task_b = asyncio.create_task(request_b())
 
         resp_a = await asyncio.wait_for(task_a, timeout=10)
@@ -1692,8 +1718,16 @@ class TestConnectMcpConcurrentReconnects:
             clientType="sse",
         )
 
-        task_a = asyncio.create_task(connect_mcp(payload=payload_a, current_user=None))
-        task_b = asyncio.create_task(connect_mcp(payload=payload_b, current_user=None))
+        task_a = asyncio.create_task(
+            connect_mcp(
+                request=_mcp_http_request(), payload=payload_a, current_user=None
+            )
+        )
+        task_b = asyncio.create_task(
+            connect_mcp(
+                request=_mcp_http_request(), payload=payload_b, current_user=None
+            )
+        )
 
         # Both reconnects must reach (and get stuck in) their independent
         # on_mcp_disconnect calls without ever unblocking each other --
@@ -2147,7 +2181,9 @@ class TestConnectMcpConnectTimeout:
             clientType="sse",
         )
 
-        response = await connect_mcp(payload=payload, current_user=None)
+        response = await connect_mcp(
+            request=_mcp_http_request(), payload=payload, current_user=None
+        )
 
         assert response.status_code == 400
 
@@ -2440,3 +2476,312 @@ class TestProjectSettingsMcpHygiene:
             assert "command" not in server
             assert "url" not in server
             assert "headers" not in server
+
+
+# ── Per-user OAuth on /mcp ─────────────────────────────────────────────────
+
+
+@pytest.fixture
+def oauth_user(mcp_session_get_by_id_patched: Mock, mock_get_current_user: Mock):
+    """Authenticate the HTTP caller as the websocket session's own user, and
+    give the session an ``emit`` so the authorization URL can be sent."""
+    mock_get_current_user.return_value = mcp_session_get_by_id_patched.user
+    mcp_session_get_by_id_patched.emit = AsyncMock()
+    return mcp_session_get_by_id_patched.user
+
+
+def _configure_http_server(test_config, oauth=None):
+    from chainlit.config import StreamableHttpMcpServer
+
+    test_config.features.mcp.enabled = True
+    test_config.features.mcp.servers = [
+        StreamableHttpMcpServer(
+            type="streamable-http",
+            name="jira",
+            url="https://mcp.example.com/mcp",
+            oauth=oauth,
+        )
+    ]
+
+
+def _destination_check(factory):
+    """Run the transport client's request hook against each URL."""
+
+    def check(url: str) -> None:
+        async def run() -> None:
+            client = factory()
+            try:
+                await client.event_hooks["request"][0](httpx.Request("GET", url))
+            finally:
+                await client.aclose()
+
+        asyncio.run(run())
+
+    return check
+
+
+class TestConnectMcpOAuth:
+    """A configured server opts into OAuth in config, a user-provided one per
+    request, and either way the provider rides the destination-checked client."""
+
+    @pytest.fixture(autouse=True)
+    def _fast_task_teardown(self, monkeypatch: pytest.MonkeyPatch):
+        """As in TestConnectMcpConnectTimeout: the failure paths below leave a
+        hung background task for stop_mcp_task to reap after _CLOSE_TIMEOUT."""
+        monkeypatch.setattr("chainlit.session._CLOSE_TIMEOUT", 0.5)
+
+    def test_a_configured_server_hands_a_user_scoped_provider_to_the_transport(
+        self,
+        test_client: TestClient,
+        test_config,
+        mcp_session_get_by_id_patched: Mock,
+        oauth_user,
+        mock_mcp_transport,
+    ):
+        from mcp.client.auth import OAuthClientProvider
+
+        from chainlit.config import McpServerOAuth
+        from chainlit.mcp_oauth import ScopedTokenStorage
+
+        _configure_http_server(test_config, oauth=McpServerOAuth())
+
+        response = test_client.post(
+            "/mcp",
+            json={"sessionId": mcp_session_get_by_id_patched.id, "name": "jira"},
+        )
+
+        assert response.status_code == 200, response.text
+        auth = mock_mcp_transport.captured["auth"]
+        assert isinstance(auth, OAuthClientProvider)
+        # Stored for the HTTP-authenticated caller and this server only.
+        storage = auth.context.storage
+        assert isinstance(storage, ScopedTokenStorage)
+        assert storage.user_identifier == oauth_user.identifier
+        assert storage.server_key == "https://mcp.example.com/mcp"
+        redirect_uris = auth.context.client_metadata.redirect_uris or []
+        assert [str(u) for u in redirect_uris] == [
+            "http://testserver/mcp/oauth/callback"
+        ]
+
+    def test_a_configured_server_without_oauth_sends_no_auth(
+        self,
+        test_client: TestClient,
+        test_config,
+        mcp_session_get_by_id_patched: Mock,
+        oauth_user,
+        mock_mcp_transport,
+    ):
+        _configure_http_server(test_config)
+
+        response = test_client.post(
+            "/mcp",
+            json={"sessionId": mcp_session_get_by_id_patched.id, "name": "jira"},
+        )
+
+        assert response.status_code == 200, response.text
+        assert mock_mcp_transport.captured["auth"] is None
+
+    def test_only_the_granted_authorization_origin_is_added(
+        self,
+        test_client: TestClient,
+        test_config,
+        mcp_session_get_by_id_patched: Mock,
+        oauth_user,
+        mock_mcp_transport,
+    ):
+        from chainlit.config import McpServerOAuth
+
+        _configure_http_server(
+            test_config,
+            oauth=McpServerOAuth(authorization_origins=["https://auth.example.com"]),
+        )
+
+        response = test_client.post(
+            "/mcp",
+            json={"sessionId": mcp_session_get_by_id_patched.id, "name": "jira"},
+        )
+        assert response.status_code == 200, response.text
+
+        check = _destination_check(mock_mcp_transport.captured["httpx_client_factory"])
+        check("https://mcp.example.com/.well-known/oauth-protected-resource")
+        check("https://auth.example.com/.well-known/oauth-authorization-server")
+        for url in (
+            "https://evil.example.com/token",
+            "http://auth.example.com/token",
+            "http://169.254.169.254/latest/meta-data/",
+        ):
+            with pytest.raises(McpDestinationError):
+                check(url)
+
+    def test_oauth_requires_an_authenticated_user(
+        self,
+        test_client: TestClient,
+        test_config,
+        mcp_session_get_by_id_patched: Mock,
+        mock_get_current_user: Mock,
+        mock_mcp_transport,
+    ):
+        from chainlit.config import McpServerOAuth
+
+        mock_get_current_user.return_value = None
+        _configure_http_server(test_config, oauth=McpServerOAuth())
+
+        response = test_client.post(
+            "/mcp",
+            json={"sessionId": mcp_session_get_by_id_patched.id, "name": "jira"},
+        )
+
+        assert response.status_code == 401
+        # Refused before any connection was attempted.
+        assert "url" not in mock_mcp_transport.captured
+
+    def test_use_oauth_is_refused_for_a_configured_server(
+        self,
+        test_client: TestClient,
+        test_config,
+        mcp_session_get_by_id_patched: Mock,
+        oauth_user,
+        mock_mcp_transport,
+    ):
+        _configure_http_server(test_config)
+
+        response = test_client.post(
+            "/mcp",
+            json={
+                "sessionId": mcp_session_get_by_id_patched.id,
+                "name": "jira",
+                "useOAuth": True,
+            },
+        )
+
+        assert response.status_code == 400
+        assert "user-provided" in response.json()["detail"]
+        assert "url" not in mock_mcp_transport.captured
+
+    def test_a_user_provided_server_opts_in_and_stays_inside_the_allowlist(
+        self,
+        test_client: TestClient,
+        test_config,
+        mcp_session_get_by_id_patched: Mock,
+        oauth_user,
+        mock_mcp_transport,
+    ):
+        from mcp.client.auth import OAuthClientProvider
+
+        test_config.features.mcp.enabled = True
+        test_config.features.mcp.user_servers.enabled = True
+        test_config.features.mcp.user_servers.allowed_urls = [
+            "https://allowed.example.com/api"
+        ]
+
+        response = test_client.post(
+            "/mcp",
+            json={
+                "sessionId": mcp_session_get_by_id_patched.id,
+                "name": "custom",
+                "url": "https://allowed.example.com/api",
+                "clientType": "streamable-http",
+                "useOAuth": True,
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        assert isinstance(mock_mcp_transport.captured["auth"], OAuthClientProvider)
+        # OAuth gets no grant of its own on a user-provided server.
+        check = _destination_check(mock_mcp_transport.captured["httpx_client_factory"])
+        with pytest.raises(McpDestinationError):
+            check("https://auth.example.com/token")
+
+    def test_a_refused_authorization_fails_the_connect_fast(
+        self,
+        test_client: TestClient,
+        test_config,
+        mcp_session_get_by_id_patched: Mock,
+        oauth_user,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The SDK transport swallows the auth flow's error, so without the
+        side channel this request would sit out the whole connect budget."""
+        from chainlit.config import McpServerOAuth
+        from chainlit.mcp_oauth import pending_authorizations
+
+        monkeypatch.setattr("chainlit.mcp._MCP_CONNECT_TIMEOUT_HTTP", 5.0)
+        monkeypatch.setattr("chainlit.mcp_oauth.AUTHORIZATION_TIMEOUT", 5.0)
+        authorize_url = "https://mcp.example.com/authorize?state=refused-state"
+
+        @asynccontextmanager
+        async def refusing_transport(url, headers=None, auth=None, **kwargs):
+            # What the SDK does on a 401: hand the URL over, await the callback.
+            await auth.context.redirect_handler(authorize_url)
+            pending_authorizations.abandon(
+                "refused-state",
+                oauth_user.identifier,
+                reason="The authorization server returned an error: access_denied",
+            )
+            try:
+                await auth.context.callback_handler()
+            except Exception:
+                pass  # swallowed, as the SDK's send loop does
+            await asyncio.Event().wait()
+            yield (AsyncMock(), AsyncMock(), AsyncMock())
+
+        monkeypatch.setattr(
+            "mcp.client.streamable_http.streamablehttp_client", refusing_transport
+        )
+        _configure_http_server(test_config, oauth=McpServerOAuth())
+
+        started = time.monotonic()
+        response = test_client.post(
+            "/mcp",
+            json={"sessionId": mcp_session_get_by_id_patched.id, "name": "jira"},
+        )
+
+        assert response.status_code == 400
+        assert time.monotonic() - started < 5
+        mcp_session_get_by_id_patched.emit.assert_any_await(
+            "mcp_authorization_required", {"name": "jira", "url": authorize_url}
+        )
+
+    def test_the_connect_budget_covers_the_authorization_and_is_then_released(
+        self,
+        test_client: TestClient,
+        test_config,
+        mcp_session_get_by_id_patched: Mock,
+        oauth_user,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from chainlit.config import McpServerOAuth
+        from chainlit.mcp_oauth import pending_authorizations
+
+        monkeypatch.setattr("chainlit.mcp._MCP_CONNECT_TIMEOUT_HTTP", 0.05)
+        monkeypatch.setattr("chainlit.mcp_oauth.AUTHORIZATION_TIMEOUT", 0.3)
+        # Near-instant teardown, so the elapsed time measures the connect budget.
+        monkeypatch.setattr("chainlit.session._CLOSE_TIMEOUT", 0.01)
+
+        @asynccontextmanager
+        async def waiting_transport(url, headers=None, auth=None, **kwargs):
+            await auth.context.redirect_handler(
+                "https://mcp.example.com/authorize?state=never-completed"
+            )
+            await auth.context.callback_handler()  # the user never comes back
+            yield (AsyncMock(), AsyncMock(), AsyncMock())
+
+        monkeypatch.setattr(
+            "mcp.client.streamable_http.streamablehttp_client", waiting_transport
+        )
+        _configure_http_server(test_config, oauth=McpServerOAuth())
+
+        started = time.monotonic()
+        response = test_client.post(
+            "/mcp",
+            json={"sessionId": mcp_session_get_by_id_patched.id, "name": "jira"},
+        )
+
+        assert response.status_code == 400
+        # The HTTP budget alone is 0.05s; the wait also covered the consent.
+        assert time.monotonic() - started >= 0.3
+        # The abandoned flow was dropped, so a late callback is refused.
+        with pytest.raises(KeyError):
+            pending_authorizations.resolve(
+                "never-completed", oauth_user.identifier, "late-code"
+            )

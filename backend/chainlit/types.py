@@ -258,7 +258,8 @@ class ConnectMCPRequest(BaseModel):
     clientType: Optional[Literal["sse", "streamable-http"]] = None
     url: Optional[str] = None
     headers: Optional[Dict[str, str]] = None
-    # Obtain a token via OAuth instead of relying on a static header.
+    # User-provided connections only: obtain a per-user token via OAuth instead
+    # of relying on a static header. Configured servers set `oauth` in config.
     useOAuth: bool = False
 
     @model_validator(mode="after")

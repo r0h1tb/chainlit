@@ -31,6 +31,8 @@ if TYPE_CHECKING:
     from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
 __all__ = [
+    "AUTHORIZATION_TIMEOUT",
+    "McpAuthorizationError",
     "McpOAuthTokenStore",
     "PendingAuthorizations",
     "ScopedTokenStorage",
@@ -41,6 +43,14 @@ __all__ = [
 ]
 
 _DEFAULT_PORTS = {"http": "80", "https": "443"}
+
+# How long a user has to finish authorizing in the browser. It bounds both the
+# pending state and, in server.py, how long a connect request waits on it.
+AUTHORIZATION_TIMEOUT = 300.0
+
+
+class McpAuthorizationError(Exception):
+    """The user's authorization ended without a code: refused, failed or dropped."""
 
 
 def canonical_server_key(server_url: str) -> str:
@@ -148,6 +158,7 @@ class _PendingAuthorization:
     result: Optional[Tuple[str, Optional[str]]] = None
     future: Optional[asyncio.Future[Tuple[str, Optional[str]]]] = None
     cancelled: bool = False
+    reason: Optional[str] = None
 
     def wait(self) -> asyncio.Future[Tuple[str, Optional[str]]]:
         if self.future is None:
@@ -155,7 +166,9 @@ class _PendingAuthorization:
             if self.result is not None:
                 self.future.set_result(self.result)
             elif self.cancelled:
-                self.future.cancel()
+                self.future.set_exception(
+                    McpAuthorizationError(self.reason or "Authorization cancelled.")
+                )
         return self.future
 
     def _complete(self, value: Tuple[str, Optional[str]]) -> None:
@@ -163,10 +176,14 @@ class _PendingAuthorization:
         if self.future is not None and not self.future.done():
             self.future.set_result(value)
 
-    def _cancel(self) -> None:
+    def _cancel(self, reason: str) -> None:
+        # An error rather than ``future.cancel()``: a CancelledError raised
+        # inside the SDK's auth flow reads as the connection itself being
+        # cancelled, and carries no message to report.
         self.cancelled = True
+        self.reason = reason
         if self.future is not None and not self.future.done():
-            self.future.cancel()
+            self.future.set_exception(McpAuthorizationError(reason))
 
 
 class PendingAuthorizations:
@@ -182,7 +199,7 @@ class PendingAuthorizations:
     replayed later.
     """
 
-    def __init__(self, ttl_seconds: float = 300.0) -> None:
+    def __init__(self, ttl_seconds: float = AUTHORIZATION_TIMEOUT) -> None:
         self._ttl = ttl_seconds
         self._pending: Dict[str, _PendingAuthorization] = {}
 
@@ -231,12 +248,17 @@ class PendingAuthorizations:
         pending._complete((code, state))
         return pending
 
-    def cancel(self, state: str) -> None:
+    def cancel(self, state: str, reason: str = "Authorization cancelled.") -> None:
         pending = self._pending.pop(state, None)
         if pending:
-            pending._cancel()
+            pending._cancel(reason)
 
-    def abandon(self, state: str, user_identifier: str) -> bool:
+    def abandon(
+        self,
+        state: str,
+        user_identifier: str,
+        reason: str = "Authorization was not completed.",
+    ) -> bool:
         """Drop a flow its owner has given up on, releasing the waiting caller.
 
         Ownership is checked for the same reason ``resolve`` checks it: without
@@ -248,7 +270,7 @@ class PendingAuthorizations:
         if pending is None or pending.user_identifier != user_identifier:
             return False
         del self._pending[state]
-        pending._cancel()
+        pending._cancel(reason)
         return True
 
     def __len__(self) -> int:
@@ -258,7 +280,7 @@ class PendingAuthorizations:
     def _drop_expired(self) -> None:
         now = time.monotonic()
         for state in [s for s, p in self._pending.items() if p.expires_at <= now]:
-            self._pending.pop(state)._cancel()
+            self._pending.pop(state)._cancel("Authorization expired.")
 
 
 # One store per Chainlit process. Tokens are held in memory: a restart forces a
@@ -273,6 +295,7 @@ def build_oauth_provider(
     redirect_uri: str,
     on_redirect: Callable[[str], Awaitable[None]],
     client_name: str = "Chainlit",
+    on_failure: Optional[Callable[[McpAuthorizationError], None]] = None,
 ):
     """Build an SDK OAuth provider scoped to one user and one MCP server.
 
@@ -285,6 +308,11 @@ def build_oauth_provider(
     is recorded when the redirect is handed over, keyed by the state already in
     that URL — registering a Chainlit-generated state instead would key the map
     on a value the browser never echoes back.
+
+    ``on_failure`` is called when the user's authorization ends without a code.
+    The SDK transports swallow exceptions raised from their send loops, so
+    raising alone would leave the connection waiting out its timeout; this is
+    the same side channel ``make_mcp_http_client_factory``'s ``on_blocked`` is.
     """
     from mcp.client.auth import OAuthClientProvider
     from mcp.shared.auth import OAuthClientMetadata
@@ -292,6 +320,7 @@ def build_oauth_provider(
 
     storage = token_store.scoped(user_identifier, server_url)
     flow: Dict[str, _PendingAuthorization] = {}
+    flow_state: Dict[str, str] = {}
 
     async def redirect_handler(authorization_url: str) -> None:
         state = extract_state(authorization_url)
@@ -303,13 +332,24 @@ def build_oauth_provider(
         flow["pending"] = pending_authorizations.register(
             state, user_identifier, server_url
         )
+        flow_state["state"] = state
         await on_redirect(authorization_url)
 
     async def callback_handler() -> Tuple[str, Optional[str]]:
         pending = flow.get("pending")
         if pending is None:  # pragma: no cover - the SDK always redirects first
             raise RuntimeError("MCP authorization was awaited before it started.")
-        return await pending.wait()
+        try:
+            return await pending.wait()
+        except McpAuthorizationError as exc:
+            if on_failure is not None:
+                on_failure(exc)
+            raise
+        except asyncio.CancelledError:
+            # The connection gave up first (timeout, teardown). Drop the flow
+            # so a late callback is refused instead of completing into nothing.
+            pending_authorizations.cancel(flow_state["state"])
+            raise
 
     return OAuthClientProvider(
         server_url=server_url,

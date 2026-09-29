@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from mcp.client.auth import OAuthClientProvider
 from mcp.shared.auth import (
@@ -5,8 +7,12 @@ from mcp.shared.auth import (
     OAuthClientMetadata,
     OAuthToken,
 )
+from pydantic import AnyUrl, ValidationError
 
+from chainlit.config import McpFeature, McpServerOAuth, StreamableHttpMcpServer
+from chainlit.mcp import McpDestinationError, _destination_on_origin
 from chainlit.mcp_oauth import (
+    McpAuthorizationError,
     McpOAuthTokenStore,
     PendingAuthorizations,
     ScopedTokenStorage,
@@ -23,7 +29,7 @@ def make_token(access_token: str) -> OAuthToken:
 def make_client_info(client_id: str) -> OAuthClientInformationFull:
     return OAuthClientInformationFull(
         client_id=client_id,
-        redirect_uris=["https://app.example.com/mcp/oauth/callback"],
+        redirect_uris=[AnyUrl("https://app.example.com/mcp/oauth/callback")],
     )
 
 
@@ -283,7 +289,6 @@ class TestMcpOAuthCallbackRoute:
 
     @pytest.fixture
     def client_and_user(self):
-
         from fastapi.testclient import TestClient
 
         from chainlit.auth import get_current_user
@@ -456,3 +461,167 @@ class TestProviderStateCorrelation:
             await provider.context.redirect_handler(
                 "https://as.example.com/authorize?client_id=c"
             )
+
+
+class TestFailingFast:
+    """A flow that ends without a code must say why, and say it promptly."""
+
+    async def test_an_abandoned_flow_raises_its_reason_not_a_cancellation(self):
+        pending = PendingAuthorizations()
+        flow = pending.register("abandoned", "alice", "https://jira.example.com/mcp")
+        waiter = flow.wait()
+
+        pending.abandon("abandoned", "alice", reason="access_denied")
+
+        with pytest.raises(McpAuthorizationError, match="access_denied"):
+            await waiter
+
+    async def test_an_expired_flow_raises_too(self):
+        pending = PendingAuthorizations(ttl_seconds=0)
+        flow = pending.register("expired", "alice", "https://jira.example.com/mcp")
+
+        assert len(pending) == 0  # expiry is applied on access
+
+        with pytest.raises(McpAuthorizationError, match="expired"):
+            await flow.wait()
+
+    async def test_the_provider_reports_a_refused_authorization(self):
+        from chainlit.mcp_oauth import pending_authorizations
+
+        failures: list[McpAuthorizationError] = []
+
+        async def on_redirect(url: str) -> None:
+            return None
+
+        provider = build_oauth_provider(
+            user_identifier="alice",
+            server_url="https://jira.example.com/mcp",
+            redirect_uri="https://app.example.com/mcp/oauth/callback",
+            on_redirect=on_redirect,
+            on_failure=failures.append,
+        )
+        await provider.context.redirect_handler(
+            "https://as.example.com/authorize?state=sdk-refused"
+        )
+        pending_authorizations.abandon("sdk-refused", "alice", reason="access_denied")
+
+        with pytest.raises(McpAuthorizationError):
+            await provider.context.callback_handler()
+        assert [str(e) for e in failures] == ["access_denied"]
+
+    async def test_a_connection_that_gives_up_drops_its_flow(self):
+        from chainlit.mcp_oauth import pending_authorizations
+
+        async def on_redirect(url: str) -> None:
+            return None
+
+        provider = build_oauth_provider(
+            user_identifier="alice",
+            server_url="https://jira.example.com/mcp",
+            redirect_uri="https://app.example.com/mcp/oauth/callback",
+            on_redirect=on_redirect,
+        )
+        await provider.context.redirect_handler(
+            "https://as.example.com/authorize?state=sdk-given-up"
+        )
+        waiting = asyncio.create_task(provider.context.callback_handler())
+        await asyncio.sleep(0)
+
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+
+        # A callback arriving afterwards is refused, not completed into nothing.
+        with pytest.raises(KeyError):
+            pending_authorizations.resolve("sdk-given-up", "alice", "late-code")
+
+
+class TestServerOAuthConfig:
+    def test_oauth_is_off_unless_configured(self):
+        server = StreamableHttpMcpServer(
+            type="streamable-http", name="jira", url="https://mcp.example.com/mcp"
+        )
+        assert server.oauth is None
+
+    def test_parses_from_the_config_file_shape(self):
+        feature = McpFeature.model_validate(
+            {
+                "enabled": True,
+                "servers": [
+                    {
+                        "name": "jira",
+                        "type": "sse",
+                        "url": "https://mcp.example.com/sse",
+                        "oauth": {
+                            "authorization_origins": ["https://auth.example.com"]
+                        },
+                    }
+                ],
+            }
+        )
+
+        server = feature.servers[0]
+        assert not isinstance(server, StreamableHttpMcpServer)
+        assert server.type == "sse"
+        assert server.oauth is not None
+        assert server.oauth.authorization_origins == ["https://auth.example.com"]
+
+    @pytest.mark.parametrize(
+        "origin",
+        [
+            "https://auth.example.com",
+            "https://auth.example.com/",
+            "http://localhost:9000",
+        ],
+    )
+    def test_accepts_a_bare_origin(self, origin):
+        assert McpServerOAuth(authorization_origins=[origin])
+
+    @pytest.mark.parametrize(
+        "origin",
+        [
+            "https://auth.example.com/oauth",
+            "https://auth.example.com/?x=1",
+            "https://auth.example.com/#frag",
+            "https://user:pw@auth.example.com",
+            "ftp://auth.example.com",
+            "auth.example.com",
+            "https://auth.example.com:99999",
+        ],
+    )
+    def test_rejects_anything_but_a_bare_origin(self, origin):
+        with pytest.raises(ValidationError):
+            McpServerOAuth(authorization_origins=[origin])
+
+
+class TestAuthorizationOrigins:
+    """OAuth requests go through the same destination check as the connection."""
+
+    def test_a_granted_origin_is_reachable(self):
+        check = _destination_on_origin(
+            "https://mcp.example.com/mcp", ["https://auth.example.com"]
+        )
+        check("https://mcp.example.com/.well-known/oauth-protected-resource")
+        check("https://auth.example.com/.well-known/oauth-authorization-server")
+        check("https://auth.example.com:443/token")
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://evil.example.com/token",
+            "http://auth.example.com/token",
+            "https://auth.example.com:8443/token",
+            "http://169.254.169.254/latest/meta-data/",
+        ],
+    )
+    def test_anything_else_is_still_refused(self, url):
+        check = _destination_on_origin(
+            "https://mcp.example.com/mcp", ["https://auth.example.com"]
+        )
+        with pytest.raises(McpDestinationError):
+            check(url)
+
+    def test_without_a_grant_the_server_keeps_to_its_own_origin(self):
+        check = _destination_on_origin("https://mcp.example.com/mcp")
+        with pytest.raises(McpDestinationError):
+            check("https://auth.example.com/token")

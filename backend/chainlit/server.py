@@ -1344,12 +1344,20 @@ async def mcp_oauth_callback(
 
     if error:
         if state:
-            pending_authorizations.abandon(state, current_user.identifier)
+            pending_authorizations.abandon(
+                state,
+                current_user.identifier,
+                reason=f"The authorization server returned an error: {error}",
+            )
         raise HTTPException(status_code=400, detail=error)
 
     if not code or not state:
         if state:
-            pending_authorizations.abandon(state, current_user.identifier)
+            pending_authorizations.abandon(
+                state,
+                current_user.identifier,
+                reason="The authorization callback carried no code.",
+            )
         raise HTTPException(status_code=400, detail="Missing code or state")
 
     try:
@@ -1481,7 +1489,12 @@ async def connect_mcp(
     )
     from mcp.client.streamable_http import streamablehttp_client
 
-    from chainlit.config import SseMcpServer, StdioMcpServer, StreamableHttpMcpServer
+    from chainlit.config import (
+        McpServerOAuth,
+        SseMcpServer,
+        StdioMcpServer,
+        StreamableHttpMcpServer,
+    )
     from chainlit.context import init_ws_context
     from chainlit.mcp import (
         _MCP_CONNECT_TIMEOUT_HTTP,
@@ -1498,6 +1511,7 @@ async def connect_mcp(
         validate_mcp_headers,
         validate_mcp_url,
     )
+    from chainlit.mcp_oauth import AUTHORIZATION_TIMEOUT, McpAuthorizationError
     from chainlit.session import McpSession, WebsocketSession, stop_mcp_task
 
     session = WebsocketSession.get_by_id(payload.sessionId)
@@ -1554,9 +1568,21 @@ async def connect_mcp(
     # Only set for stdio named servers; merged into the spawn environment in
     # the background runner.
     stdio_env: Optional[Dict[str, str]] = None
+    # Set for a named server whose config asks for OAuth. User-provided
+    # connections opt in per request with ``useOAuth`` instead.
+    oauth_settings: Optional[McpServerOAuth] = None
 
     try:
         if payload.url is None:
+            if payload.useOAuth:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "useOAuth applies to user-provided MCP servers. A configured "
+                        "server enables OAuth with `oauth` on its "
+                        "[[features.mcp.servers]] entry."
+                    ),
+                )
             # Named server: look it up in developer-configured servers
             server_cfg = next(
                 (s for s in config.features.mcp.servers if s.name == payload.name),
@@ -1602,12 +1628,14 @@ async def connect_mcp(
                     name=payload.name,
                     headers=server_cfg.headers,
                 )
+                oauth_settings = server_cfg.oauth
             elif isinstance(server_cfg, StreamableHttpMcpServer):
                 mcp_connection = HttpMcpConnection(
                     url=server_cfg.url,
                     name=payload.name,
                     headers=server_cfg.headers,
                 )
+                oauth_settings = server_cfg.oauth
             else:
                 raise HTTPException(
                     status_code=500, detail="Unknown server config type"
@@ -1650,13 +1678,33 @@ async def connect_mcp(
     # opened it — avoiding the cross-task cancel-scope corruption from
     # https://github.com/Chainlit/chainlit/issues/2182.
 
+    ready_event: asyncio.Event = asyncio.Event()
+    stop_event: asyncio.Event = asyncio.Event()
+    # Mutable container to pass the ClientSession (or an error) back from
+    # the bg task.
+    result_holder: dict[str, object] = {}
+
+    def _record_blocked(exc: McpDestinationError) -> None:
+        # Fail-fast side channel: mcp/client/sse.py and
+        # mcp/client/streamable_http.py swallow exceptions raised from the
+        # httpx request hook (bare ``except Exception: logger.exception``,
+        # no re-raise), so a blocked destination would otherwise never
+        # reach ``ClientSession.initialize()`` and ``ready_event`` would
+        # never be set — hanging the bounded wait below until its timeout.
+        # This unblocks it immediately instead.
+        if "error" not in result_holder:
+            result_holder["error"] = exc
+        ready_event.set()
+
     # ── Optional per-user OAuth ──
     #
     # The SDK provider performs discovery, dynamic client registration and
     # PKCE. Chainlit supplies the user scope, so a token obtained here is only
-    # ever replayed for the same user and the same server.
+    # ever replayed for the same user and the same server. The provider's own
+    # requests go through the destination-checked client bound below, so they
+    # are held to the same grant as the connection.
     oauth_provider = None
-    if getattr(payload, "useOAuth", False):
+    if oauth_settings is not None or payload.useOAuth:
         if not isinstance(mcp_connection, (SseMcpConnection, HttpMcpConnection)):
             raise HTTPException(
                 status_code=400,
@@ -1677,30 +1725,21 @@ async def connect_mcp(
                 {"name": payload.name, "url": auth_url},
             )
 
+        def _record_authorization_failure(exc: McpAuthorizationError) -> None:
+            # Same side channel as _record_blocked: the SDK transports swallow
+            # the error raised from the auth flow, so a refused or abandoned
+            # authorization would otherwise sit out the whole connect timeout.
+            if "error" not in result_holder:
+                result_holder["error"] = exc
+            ready_event.set()
+
         oauth_provider = build_oauth_provider(
             user_identifier=current_user.identifier,
             server_url=mcp_connection.url,
             redirect_uri=f"{get_user_facing_url(request.url)}/oauth/callback",
             on_redirect=_emit_authorization_url,
+            on_failure=_record_authorization_failure,
         )
-
-    ready_event: asyncio.Event = asyncio.Event()
-    stop_event: asyncio.Event = asyncio.Event()
-    # Mutable container to pass the ClientSession (or an error) back from
-    # the bg task.
-    result_holder: dict[str, object] = {}
-
-    def _record_blocked(exc: McpDestinationError) -> None:
-        # Fail-fast side channel: mcp/client/sse.py and
-        # mcp/client/streamable_http.py swallow exceptions raised from the
-        # httpx request hook (bare ``except Exception: logger.exception``,
-        # no re-raise), so a blocked destination would otherwise never
-        # reach ``ClientSession.initialize()`` and ``ready_event`` would
-        # never be set — hanging the bounded wait below until its timeout.
-        # This unblocks it immediately instead.
-        if "error" not in result_holder:
-            result_holder["error"] = exc
-        ready_event.set()
 
     # ── Bind the destination-checking httpx client factory ──
     #
@@ -1722,7 +1761,10 @@ async def connect_mcp(
             )
         else:
             mcp_http_client_factory = make_mcp_http_client_factory(
-                _destination_on_origin(mcp_connection.url),
+                _destination_on_origin(
+                    mcp_connection.url,
+                    oauth_settings.authorization_origins if oauth_settings else (),
+                ),
                 on_blocked=_record_blocked,
             )
 
@@ -1835,6 +1877,9 @@ async def connect_mcp(
         if isinstance(mcp_connection, StdioMcpConnection)
         else _MCP_CONNECT_TIMEOUT_HTTP
     )
+    if oauth_provider is not None:
+        # The user may first have to sign in and consent in the browser.
+        connect_timeout += AUTHORIZATION_TIMEOUT
     try:
         await asyncio.wait_for(ready_event.wait(), timeout=connect_timeout)
     except asyncio.TimeoutError:
