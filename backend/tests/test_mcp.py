@@ -2530,6 +2530,15 @@ class TestConnectMcpOAuth:
         hung background task for stop_mcp_task to reap after _CLOSE_TIMEOUT."""
         monkeypatch.setattr("chainlit.session._CLOSE_TIMEOUT", 0.5)
 
+    @pytest.fixture(autouse=True)
+    def _fresh_oauth_state(self):
+        """The pending map is a process-wide singleton the app itself uses."""
+        from chainlit.mcp_oauth import pending_authorizations
+
+        pending_authorizations._pending.clear()
+        yield
+        pending_authorizations._pending.clear()
+
     def test_a_configured_server_hands_a_user_scoped_provider_to_the_transport(
         self,
         test_client: TestClient,
@@ -2537,12 +2546,15 @@ class TestConnectMcpOAuth:
         mcp_session_get_by_id_patched: Mock,
         oauth_user,
         mock_mcp_transport,
+        monkeypatch: pytest.MonkeyPatch,
     ):
         from mcp.client.auth import OAuthClientProvider
 
         from chainlit.config import McpServerOAuth
         from chainlit.mcp_oauth import ScopedTokenStorage
 
+        # get_user_facing_url() would rebase the callback on CHAINLIT_URL.
+        monkeypatch.delenv("CHAINLIT_URL", raising=False)
         _configure_http_server(test_config, oauth=McpServerOAuth())
 
         response = test_client.post(
@@ -2785,3 +2797,40 @@ class TestConnectMcpOAuth:
             pending_authorizations.resolve(
                 "never-completed", oauth_user.identifier, "late-code"
             )
+
+    def test_a_connect_that_never_redirects_keeps_the_ordinary_budget(
+        self,
+        test_client: TestClient,
+        test_config,
+        mcp_session_get_by_id_patched: Mock,
+        oauth_user,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """With a cached or refreshed token nobody is sent to the browser, so
+        a server that is down must fail on the HTTP budget, not wait out the
+        authorization window as well."""
+        from chainlit.config import McpServerOAuth
+
+        monkeypatch.setattr("chainlit.mcp._MCP_CONNECT_TIMEOUT_HTTP", 0.05)
+        monkeypatch.setattr("chainlit.mcp_oauth.AUTHORIZATION_TIMEOUT", 5.0)
+        monkeypatch.setattr("chainlit.session._CLOSE_TIMEOUT", 0.01)
+
+        @asynccontextmanager
+        async def unresponsive_transport(url, headers=None, auth=None, **kwargs):
+            await asyncio.Event().wait()  # the server never answers
+            yield (AsyncMock(), AsyncMock(), AsyncMock())
+
+        monkeypatch.setattr(
+            "mcp.client.streamable_http.streamablehttp_client", unresponsive_transport
+        )
+        _configure_http_server(test_config, oauth=McpServerOAuth())
+
+        started = time.monotonic()
+        response = test_client.post(
+            "/mcp",
+            json={"sessionId": mcp_session_get_by_id_patched.id, "name": "jira"},
+        )
+
+        assert response.status_code == 400
+        assert time.monotonic() - started < 2
+        mcp_session_get_by_id_patched.emit.assert_not_awaited()

@@ -1,4 +1,5 @@
 import asyncio
+from urllib.parse import parse_qs
 
 import pytest
 from mcp.client.auth import OAuthClientProvider
@@ -22,6 +23,22 @@ from chainlit.mcp_oauth import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _fresh_oauth_state():
+    """The token store and pending map are process-wide singletons that the
+    app itself uses; start and leave each test with both empty."""
+    from chainlit.mcp_oauth import pending_authorizations, token_store
+
+    def clear() -> None:
+        pending_authorizations._pending.clear()
+        token_store._tokens.clear()
+        token_store._clients.clear()
+
+    clear()
+    yield
+    clear()
+
+
 def make_token(access_token: str) -> OAuthToken:
     return OAuthToken(access_token=access_token, token_type="Bearer")
 
@@ -40,11 +57,12 @@ class TestCanonicalServerKey:
         ("a", "b"),
         [
             ("https://mcp.example.com/sse", "https://MCP.Example.com/sse"),
-            ("https://mcp.example.com/sse", "https://mcp.example.com/sse/"),
+            ("https://mcp.example.com/sse", "HTTPS://mcp.example.com/sse"),
             ("https://mcp.example.com/sse", "https://mcp.example.com:443/sse"),
             ("http://mcp.example.com/sse", "http://mcp.example.com:80/sse"),
-            ("https://mcp.example.com/sse", "https://mcp.example.com/sse?x=1"),
             ("https://mcp.example.com/sse", "https://mcp.example.com/sse#frag"),
+            ("https://mcp.example.com", "https://mcp.example.com/"),
+            ("https://[::ABCD]/mcp", "https://[::abcd]:443/mcp"),
         ],
     )
     def test_equivalent_urls_share_a_key(self, a, b):
@@ -60,6 +78,13 @@ class TestCanonicalServerKey:
             # http and https are different origins.
             ("http://example.com/sse", "https://example.com/sse"),
             ("https://a.example.com/sse", "https://b.example.com/sse"),
+            # Kept as the SDK keeps them in the RFC 8707 resource URL: a
+            # trailing slash or a query can select another server or tenant.
+            ("https://example.com/mcp", "https://example.com/mcp/"),
+            ("https://example.com/mcp?tenant=a", "https://example.com/mcp?tenant=b"),
+            ("https://example.com/mcp", "https://example.com/mcp?tenant=a"),
+            # A port must not run into an IPv6 address.
+            ("https://[::1]:8443/mcp", "https://[::1:8443]/mcp"),
         ],
     )
     def test_distinct_servers_get_distinct_keys(self, a, b):
@@ -144,7 +169,7 @@ class TestIsolation:
 
     async def test_equivalent_urls_reuse_the_same_token(self):
         store = McpOAuthTokenStore()
-        await store.scoped("alice", "https://Jira.Example.com/mcp/").set_tokens(
+        await store.scoped("alice", "https://Jira.Example.com/mcp").set_tokens(
             make_token("jira-token")
         )
 
@@ -185,7 +210,7 @@ class TestForgetting:
         await store.scoped("alice", jira).set_tokens(make_token("a-jira"))
         await store.scoped("alice", confluence).set_tokens(make_token("a-conf"))
 
-        store.forget_server("alice", "https://JIRA.example.com/mcp/")
+        store.forget_server("alice", "https://JIRA.example.com:443/mcp")
 
         assert await store.scoped("alice", jira).get_tokens() is None
         kept = await store.scoped("alice", confluence).get_tokens()
@@ -281,7 +306,7 @@ class TestScopeAccessors:
         scoped = McpOAuthTokenStore().scoped("alice", "https://Example.com/mcp/")
         assert isinstance(scoped, ScopedTokenStorage)
         assert scoped.user_identifier == "alice"
-        assert scoped.server_key == "https://example.com/mcp"
+        assert scoped.server_key == "https://example.com/mcp/"
 
 
 class TestMcpOAuthCallbackRoute:
@@ -445,6 +470,43 @@ class TestProviderStateCorrelation:
         pending_authorizations.resolve("sdk-echo", "alice", "the-code")
 
         assert await provider.context.callback_handler() == ("the-code", "sdk-echo")
+
+    async def test_the_sdk_consumes_what_the_callback_returns(self):
+        """Run the SDK's own authorization step against this provider, not
+        only our half of it: the SDK has to unpack the callback's result, match
+        the state it minted, and carry the code into the token request."""
+        from chainlit.mcp_oauth import pending_authorizations
+
+        redirects: list[str] = []
+        redirected = asyncio.Event()
+
+        async def on_redirect(url: str) -> None:
+            redirects.append(url)
+            redirected.set()
+
+        redirect_uri = "https://app.example.com/mcp/oauth/callback"
+        provider = build_oauth_provider(
+            user_identifier="alice",
+            server_url="https://jira.example.com/mcp",
+            redirect_uri=redirect_uri,
+            on_redirect=on_redirect,
+        )
+        provider.context.client_info = OAuthClientInformationFull(
+            client_id="chainlit-client", redirect_uris=[AnyUrl(redirect_uri)]
+        )
+
+        authorizing = asyncio.create_task(provider._perform_authorization())
+        await asyncio.wait_for(redirected.wait(), timeout=5)
+        state = extract_state(redirects[0])
+        assert state is not None
+        pending_authorizations.resolve(state, "alice", "the-code")
+
+        token_request = await asyncio.wait_for(authorizing, timeout=5)
+
+        assert token_request.method == "POST"
+        body = parse_qs(token_request.content.decode())
+        assert body["grant_type"] == ["authorization_code"]
+        assert body["code"] == ["the-code"]
 
     async def test_a_url_without_state_is_refused(self):
         async def on_redirect(url: str) -> None:

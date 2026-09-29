@@ -1680,6 +1680,9 @@ async def connect_mcp(
 
     ready_event: asyncio.Event = asyncio.Event()
     stop_event: asyncio.Event = asyncio.Event()
+    # Set once the user has been sent to authorize in the browser — only
+    # then does the connect wait stretch to cover their sign-in and consent.
+    authorization_requested: asyncio.Event = asyncio.Event()
     # Mutable container to pass the ClientSession (or an error) back from
     # the bg task.
     result_holder: dict[str, object] = {}
@@ -1724,6 +1727,7 @@ async def connect_mcp(
                 "mcp_authorization_required",
                 {"name": payload.name, "url": auth_url},
             )
+            authorization_requested.set()
 
         def _record_authorization_failure(exc: McpAuthorizationError) -> None:
             # Same side channel as _record_blocked: the SDK transports swallow
@@ -1877,13 +1881,21 @@ async def connect_mcp(
         if isinstance(mcp_connection, StdioMcpConnection)
         else _MCP_CONNECT_TIMEOUT_HTTP
     )
-    if oauth_provider is not None:
-        # The user may first have to sign in and consent in the browser.
-        connect_timeout += AUTHORIZATION_TIMEOUT
     try:
         await asyncio.wait_for(ready_event.wait(), timeout=connect_timeout)
     except asyncio.TimeoutError:
-        pass
+        if authorization_requested.is_set():
+            # The user was sent to sign in and consent in the browser, which
+            # gets a window of its own. A cached or refreshed token never gets
+            # here, so a server that is simply down still fails on the HTTP
+            # budget rather than after the authorization window.
+            connect_timeout += AUTHORIZATION_TIMEOUT
+            try:
+                await asyncio.wait_for(
+                    ready_event.wait(), timeout=AUTHORIZATION_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                pass
     if "error" not in result_holder and "client" not in result_holder:
         result_holder["error"] = asyncio.TimeoutError(
             f"Timed out after {connect_timeout:.0f}s waiting for the MCP "

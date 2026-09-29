@@ -56,24 +56,27 @@ class McpAuthorizationError(Exception):
 def canonical_server_key(server_url: str) -> str:
     """Return a stable key identifying the MCP server behind ``server_url``.
 
-    Scheme and host are compared case-insensitively and a default port is
-    dropped, so the same server reached by equivalent URLs shares one token.
-    The path is kept: two MCP servers are routinely mounted on one host, and
-    collapsing them would let a token issued for one be sent to the other.
+    Only what RFC 3986 makes equivalent is normalised: scheme and host case,
+    a default port, and an empty path. Everything else is kept as the MCP SDK
+    keeps it in the RFC 8707 resource URL (``resource_url_from_server_url``):
+    the exact path, trailing slash included, and the query, either of which can
+    select a different server or tenant on one host. Sharing a token across
+    those would present it to a server that did not ask for it.
     """
     parts = urlsplit(server_url)
     scheme = parts.scheme.lower()
     hostname = (parts.hostname or "").lower()
+    # urlsplit strips an IPv6 literal's brackets; without them the port would
+    # run into the address ("::1" + ":8443" reads as the host "::1:8443").
+    host = f"[{hostname}]" if ":" in hostname else hostname
 
-    netloc = hostname
+    netloc = host
     if parts.port is not None and _DEFAULT_PORTS.get(scheme) != str(parts.port):
-        netloc = f"{hostname}:{parts.port}"
+        netloc = f"{host}:{parts.port}"
 
-    path = parts.path.rstrip("/")
-
-    # Query and fragment never identify the server, and credentials in the
-    # netloc must not leak into a dictionary key.
-    return urlunsplit((scheme, netloc, path, "", ""))
+    # The fragment never reaches the server, and credentials in the netloc must
+    # not leak into a dictionary key.
+    return urlunsplit((scheme, netloc, parts.path or "/", parts.query, ""))
 
 
 def extract_state(authorization_url: str) -> Optional[str]:
@@ -335,6 +338,8 @@ def build_oauth_provider(
         flow_state["state"] = state
         await on_redirect(authorization_url)
 
+    # NOTE: mcp 1.x unpacks this as a (code, state) tuple; 2.0.0 expects an
+    # AuthorizationCodeResult instead — update this on bump.
     async def callback_handler() -> Tuple[str, Optional[str]]:
         pending = flow.get("pending")
         if pending is None:  # pragma: no cover - the SDK always redirects first
