@@ -9,7 +9,8 @@ import {
   IMcp,
   mcpState,
   openMcpAuthorizationUrl,
-  sessionIdState
+  sessionIdState,
+  setMcpAwaitingSignIn
 } from '@chainlit/react-client';
 
 import CopyButton from '@/components/CopyButton';
@@ -39,7 +40,9 @@ export const McpList = ({ onAddNewClick }: McpListProps) => {
   const [isLoading, setIsLoading] = useState(false);
 
   const deleteMcp = (mcp: IMcp) => {
-    if (mcp.status === 'connected') {
+    // A server still waiting on sign-in is disconnected too, so the backend
+    // drops the pending connection instead of attaching it later.
+    if (mcp.status === 'connected' || mcp.authorizationUrl) {
       setIsLoading(true);
 
       toast.promise(
@@ -239,13 +242,7 @@ const ReconnectMcpButton = ({ mcp }: { mcp: IMcp }) => {
     // sign in, and the outcome then arrives over the socket.
     const applyResponse = (resp: any) => {
       if (resp.status === 'authorization_required') {
-        setMcps((prev) =>
-          prev.map((existingMcp) =>
-            existingMcp.name === mcp.name
-              ? { ...existingMcp, authorizationUrl: resp.url }
-              : existingMcp
-          )
-        );
+        setMcps((prev) => setMcpAwaitingSignIn(prev, mcp.name, resp.url));
         return 'Waiting for you to sign in...';
       }
       const { success, mcp: updatedMcp } = resp;

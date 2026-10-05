@@ -40,14 +40,19 @@ import {
   IAction,
   ICommand,
   IElement,
-  IMcp,
+  IMcpPayload,
   IMessageElement,
   IMode,
   IStep,
   ITasklistElement,
   IThread
 } from 'src/types';
-import { openMcpAuthorizationUrl } from 'src/utils/mcp';
+import {
+  openMcpAuthorizationUrl,
+  setMcpAwaitingSignIn,
+  setMcpConnected,
+  setMcpFailed
+} from 'src/utils/mcp';
 import {
   addMessage,
   deleteMessageById,
@@ -209,13 +214,7 @@ const useChatSession = () => {
       socket.on(
         'mcp_authorization_required',
         ({ name, url }: { name: string; url: string }) => {
-          setMcps((prev) =>
-            prev.map((mcp) =>
-              mcp.name === name
-                ? { ...mcp, status: 'connecting', authorizationUrl: url }
-                : mcp
-            )
-          );
+          setMcps((prev) => setMcpAwaitingSignIn(prev, name, url));
           toast.info(`Sign in to finish connecting ${name}`, {
             id: `mcp-${name}`,
             duration: Infinity,
@@ -227,34 +226,15 @@ const useChatSession = () => {
         }
       );
 
-      socket.on('mcp_connected', ({ mcp }: { mcp: IMcp }) => {
-        const connected = {
-          status: 'connected' as const,
-          tools: mcp.tools,
-          authorizationUrl: undefined
-        };
-        setMcps((prev) =>
-          prev.some((existingMcp) => existingMcp.name === mcp.name)
-            ? prev.map((existingMcp) =>
-                existingMcp.name === mcp.name
-                  ? { ...existingMcp, ...connected }
-                  : existingMcp
-              )
-            : [...prev, { ...mcp, ...connected }]
-        );
+      socket.on('mcp_connected', ({ mcp }: { mcp: IMcpPayload }) => {
+        setMcps((prev) => setMcpConnected(prev, mcp));
         toast.success(`${mcp.name} connected`, { id: `mcp-${mcp.name}` });
       });
 
       socket.on(
         'mcp_connection_failed',
         ({ name, detail }: { name: string; detail: string }) => {
-          setMcps((prev) =>
-            prev.map((mcp) =>
-              mcp.name === name
-                ? { ...mcp, status: 'failed', authorizationUrl: undefined }
-                : mcp
-            )
-          );
+          setMcps((prev) => setMcpFailed(prev, name));
           toast.error(detail, { id: `mcp-${name}` });
         }
       );

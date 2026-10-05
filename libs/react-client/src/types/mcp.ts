@@ -19,11 +19,18 @@ export interface IMcp {
   authorizationUrl?: string;
 }
 
+// A server as POST /mcp and `mcp_connected` describe it: there is no
+// `status`, and `url`/`headers` are null for a named server.
+export type IMcpPayload = Omit<IMcp, 'status' | 'url' | 'headers'> & {
+  url: string | null;
+  headers: Record<string, string> | null;
+};
+
 // POST /mcp answers with this when the user has to sign in before the
 // connection can finish. The outcome then arrives over the socket as
 // `mcp_connected` or `mcp_connection_failed`.
 export interface IMcpAuthorizationRequired {
   status: 'authorization_required';
   url: string;
-  mcp: IMcp;
+  mcp: IMcpPayload;
 }

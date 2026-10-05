@@ -1483,9 +1483,10 @@ async def _wait_for_any(events: List[asyncio.Event], timeout: float) -> None:
             waiter.cancel()
 
 
-# Connections handed to the background while the user signs in. asyncio keeps
-# only weak references to tasks, so these hold them until they finish.
-_mcp_connects_awaiting_authorization: set[asyncio.Task] = set()
+# Connections handed to the background while the user signs in, by session id
+# and server name, so a disconnect can stop one. asyncio keeps only weak
+# references to tasks, so this also holds them until they finish.
+_mcp_connects_awaiting_authorization: Dict[tuple[str, str], asyncio.Task] = {}
 
 
 @router.post("/mcp")
@@ -1936,7 +1937,7 @@ async def connect_mcp(
                 "connection to initialize."
             )
 
-        if "error" in result_holder:
+        async def _fail(error: BaseException, log_message: str) -> str:
             # Always route through stop_mcp_task rather than a bare ``await
             # task`` — the discriminator is "is the task done", not "did the
             # wait raise": on the timeout/blocked paths the runner may still be
@@ -1944,25 +1945,33 @@ async def connect_mcp(
             # wait-then-cancel unsticks that (and closes a latent unbounded
             # hang if ``exit_stack.aclose()`` itself stalls).
             await stop_mcp_task(task, stop_event, payload.name)
-            connect_error = cast(BaseException, result_holder["error"])
             if is_user_provided:
                 # The client already supplied this URL, so echoing the failure
                 # detail back is useful and leaks nothing new.
-                return f"Could not connect to the MCP: {connect_error!s}"
+                return f"Could not connect to the MCP: {error!s}"
             # Named servers are developer config and may embed secrets in
             # userinfo or query params — httpx errors routinely include the
             # request URL in their string form, so never return it verbatim.
-            logger.error(
-                "Failed to connect to MCP server %r",
-                payload.name,
-                exc_info=connect_error,
-            )
+            logger.error(log_message, payload.name, exc_info=error)
             return (
                 "Could not connect to the MCP server. Check the server logs "
                 "for details."
             )
 
+        if "error" in result_holder:
+            return await _fail(
+                cast(BaseException, result_holder["error"]),
+                "Failed to connect to MCP server %r",
+            )
+
         mcp_client_session = cast("ClientSession", result_holder["client"])
+
+        # List the tools before anything is attached, so a server that fails
+        # here leaves no half-connected session behind.
+        try:
+            tool_list = await mcp_client_session.list_tools()
+        except Exception as e:
+            return await _fail(e, "Failed to list the tools of MCP server %r")
 
         # Call the user callback
         if config.code.on_mcp_connect:
@@ -1970,17 +1979,8 @@ async def connect_mcp(
                 await config.code.on_mcp_connect(mcp_connection, mcp_client_session)
             except Exception as e:
                 # Callback failed — tear down the connection.
-                await stop_mcp_task(task, stop_event, payload.name)
-                if is_user_provided:
-                    return f"Could not connect to the MCP: {e!s}"
-                logger.error(
-                    "on_mcp_connect callback failed for MCP server %r",
-                    payload.name,
-                    exc_info=e,
-                )
-                return (
-                    "Could not connect to the MCP server. Check the server "
-                    "logs for details."
+                return await _fail(
+                    e, "on_mcp_connect callback failed for MCP server %r"
                 )
 
         # Disconnect previous session for this name (reconnection). Runs only
@@ -2033,7 +2033,6 @@ async def connect_mcp(
                     "Error closing old MCP session %s", payload.name, exc_info=True
                 )
 
-        tool_list = await mcp_client_session.list_tools()
         return _mcp_payload([{"name": t.name} for t in tool_list.tools])
 
     async def _finish_after_authorization() -> None:
@@ -2041,23 +2040,37 @@ async def connect_mcp(
         # its ordinary budget on top of it.
         budget = connect_timeout + AUTHORIZATION_TIMEOUT
         try:
-            await asyncio.wait_for(ready_event.wait(), timeout=budget)
-        except asyncio.TimeoutError:
-            pass
-        if WebsocketSession.get_by_id(session.id) is not session:
-            # The session closed while the user was signing in, so there is
-            # nothing left to attach the connection to.
+            try:
+                await asyncio.wait_for(ready_event.wait(), timeout=budget)
+            except asyncio.TimeoutError:
+                pass
+            if WebsocketSession.get_by_id(session.id) is not session:
+                # The session closed while the user was signing in, so there
+                # is nothing left to attach the connection to.
+                await stop_mcp_task(task, stop_event, payload.name)
+                return
+            try:
+                outcome = await _complete_connection(budget)
+            except Exception:
+                # Nobody is waiting on a response to raise into, so report it.
+                logger.exception("Failed to finish MCP connection %r", payload.name)
+                outcome = (
+                    "Could not connect to the MCP server. Check the server "
+                    "logs for details."
+                )
+        except asyncio.CancelledError:
+            # Disconnected, or replaced by a newer attempt, before it finished.
             await stop_mcp_task(task, stop_event, payload.name)
+            raise
+        if (
+            not isinstance(outcome, str)
+            and WebsocketSession.get_by_id(session.id) is not session
+        ):
+            # The session closed while the connection was being finished, after
+            # its own teardown had run, so close what was just attached.
+            if (attached := session.mcp_sessions.pop(payload.name, None)) is not None:
+                await attached.close()
             return
-        try:
-            outcome = await _complete_connection(budget)
-        except Exception:
-            # Nobody is waiting on a response to raise into, so report it.
-            logger.exception("Failed to finish MCP connection %r", payload.name)
-            outcome = (
-                "Could not connect to the MCP server. Check the server logs "
-                "for details."
-            )
         try:
             if isinstance(outcome, str):
                 await context.emitter.emit(
@@ -2079,11 +2092,20 @@ async def connect_mcp(
         # that browser round-trip is fragile behind proxies and load balancers,
         # so return now and report the result over the socket instead, as
         # `mcp_connected` or `mcp_connection_failed`.
+        key = (session.id, payload.name)
+        if (previous := _mcp_connects_awaiting_authorization.get(key)) is not None:
+            # A newer attempt replaces one that is still waiting on its sign-in.
+            previous.cancel()
         finish = asyncio.create_task(
             _finish_after_authorization(), name=f"mcp-authorize-{payload.name}"
         )
-        _mcp_connects_awaiting_authorization.add(finish)
-        finish.add_done_callback(_mcp_connects_awaiting_authorization.discard)
+        _mcp_connects_awaiting_authorization[key] = finish
+
+        def _forget(done: asyncio.Task) -> None:
+            if _mcp_connects_awaiting_authorization.get(key) is done:
+                del _mcp_connects_awaiting_authorization[key]
+
+        finish.add_done_callback(_forget)
         return JSONResponse(
             status_code=202,
             content={
@@ -2118,6 +2140,13 @@ async def disconnect_mcp(
             raise HTTPException(
                 status_code=401,
             )
+
+    # A connection still waiting on its sign-in isn't in mcp_sessions yet. Stop
+    # it, so a sign-in finished later can't attach it after all.
+    pending = _mcp_connects_awaiting_authorization.pop((session.id, payload.name), None)
+    if pending is not None:
+        pending.cancel()
+        await asyncio.wait([pending])
 
     callback = config.code.on_mcp_disconnect
     if payload.name in session.mcp_sessions:

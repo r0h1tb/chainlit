@@ -967,6 +967,41 @@ class TestConnectMcpEndpoint:
         assert data["mcp"]["url"] is None
         assert data["mcp"]["headers"] is None
 
+    def test_a_server_that_cannot_list_its_tools_is_not_attached(
+        self,
+        test_client: TestClient,
+        test_config,
+        mcp_session_get_by_id_patched: Mock,
+        mock_get_current_user: Mock,
+        mock_mcp_transport,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from chainlit.config import SseMcpServer
+
+        async def failing_list_tools(self):
+            raise RuntimeError("the server went away")
+
+        monkeypatch.setattr(mock_mcp_transport, "list_tools", failing_list_tools)
+        on_mcp_connect = AsyncMock()
+        monkeypatch.setattr(test_config.code, "on_mcp_connect", on_mcp_connect)
+        mock_get_current_user.return_value = None
+        test_config.features.mcp.enabled = True
+        test_config.features.mcp.servers = [
+            SseMcpServer(type="sse", name="github", url="https://mcp.example.com/sse")
+        ]
+
+        response = test_client.post(
+            "/mcp",
+            json={
+                "sessionId": mcp_session_get_by_id_patched.id,
+                "name": "github",
+            },
+        )
+
+        assert response.status_code == 400, response.text
+        assert "github" not in mcp_session_get_by_id_patched.mcp_sessions
+        on_mcp_connect.assert_not_awaited()
+
     def test_unknown_named_server_returns_400(
         self,
         test_client: TestClient,
@@ -3061,3 +3096,89 @@ class TestConnectMcpOAuthInBackground:
 
         assert _emitted(mcp_session_get_by_id_patched.emit, "mcp_connected") == []
         assert "jira" not in mcp_session_get_by_id_patched.mcp_sessions
+
+    @pytest.mark.asyncio
+    async def test_a_disconnect_while_waiting_on_sign_in_stops_the_connection(
+        self,
+        mcp_chainlit_app,
+        test_config,
+        mcp_session_get_by_id_patched: Mock,
+        oauth_user,
+        mock_mcp_transport,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from chainlit.config import McpServerOAuth
+        from chainlit.mcp_oauth import pending_authorizations
+
+        monkeypatch.setattr(
+            "mcp.client.streamable_http.streamablehttp_client",
+            self._transport_waiting_for_sign_in("dropped-state"),
+        )
+        _configure_http_server(test_config, oauth=McpServerOAuth())
+
+        response = await self._start_connect(
+            mcp_chainlit_app, mcp_session_get_by_id_patched.id
+        )
+        assert response.status_code == 202, response.text
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=mcp_chainlit_app),
+            base_url="http://testserver",
+        ) as client:
+            response = await client.request(
+                "DELETE",
+                "/mcp",
+                json={"sessionId": mcp_session_get_by_id_patched.id, "name": "jira"},
+            )
+        assert response.status_code == 200, response.text
+        await _wait_for_background_connects()
+
+        # The sign-in can no longer complete, and nothing was attached.
+        with pytest.raises(KeyError):
+            pending_authorizations.resolve(
+                "dropped-state", oauth_user.identifier, "code"
+            )
+        assert "jira" not in mcp_session_get_by_id_patched.mcp_sessions
+        assert _emitted(mcp_session_get_by_id_patched.emit, "mcp_connected") == []
+
+    @pytest.mark.asyncio
+    async def test_a_connection_attached_as_the_session_closes_is_closed(
+        self,
+        mcp_chainlit_app,
+        test_config,
+        mcp_session_get_by_id_patched: Mock,
+        oauth_user,
+        mock_mcp_transport,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from chainlit.config import McpServerOAuth
+        from chainlit.mcp_oauth import pending_authorizations
+
+        monkeypatch.setattr(
+            "mcp.client.streamable_http.streamablehttp_client",
+            self._transport_waiting_for_sign_in("closing-state"),
+        )
+        _configure_http_server(test_config, oauth=McpServerOAuth())
+
+        async def close_the_session_meanwhile(connection, client):
+            # The tab is closed while on_mcp_connect is still running, so the
+            # session's own teardown runs before the connection is attached.
+            monkeypatch.setattr(
+                "chainlit.session.WebsocketSession.get_by_id",
+                lambda session_id: None,
+            )
+
+        monkeypatch.setattr(
+            test_config.code, "on_mcp_connect", close_the_session_meanwhile
+        )
+
+        response = await self._start_connect(
+            mcp_chainlit_app, mcp_session_get_by_id_patched.id
+        )
+        assert response.status_code == 202, response.text
+
+        pending_authorizations.resolve("closing-state", oauth_user.identifier, "code")
+        await _wait_for_background_connects()
+
+        assert "jira" not in mcp_session_get_by_id_patched.mcp_sessions
+        assert _emitted(mcp_session_get_by_id_patched.emit, "mcp_connected") == []

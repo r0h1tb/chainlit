@@ -74,7 +74,14 @@ export const McpAddForm = ({ onSuccess, onCancel }: McpAddFormProps) => {
         ? prev
         : [
             ...prev,
-            { ...mcp, ...extra, status: 'connecting', authorizationUrl: url }
+            {
+              ...mcp,
+              url: mcp.url ?? undefined,
+              headers: mcp.headers ?? undefined,
+              ...extra,
+              status: 'connecting',
+              authorizationUrl: url
+            }
           ]
     );
   };

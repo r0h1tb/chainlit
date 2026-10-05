@@ -1,3 +1,5 @@
+import { IMcp, IMcpPayload } from '..';
+
 /**
  * Open an MCP server's sign-in page in a new tab.
  *
@@ -9,10 +11,51 @@ export const openMcpAuthorizationUrl = (url: string) => {
   try {
     protocol = new URL(url).protocol;
   } catch {
+    console.warn('Not opening the MCP sign-in link: it is not a valid URL.');
     return;
   }
   if (protocol !== 'https:' && protocol !== 'http:') {
+    console.warn(
+      `Not opening the MCP sign-in link: ${protocol} links are not allowed.`
+    );
     return;
   }
   window.open(url, '_blank', 'noopener,noreferrer');
 };
+
+// Updates for a connection that waits on the user's sign-in. Each one only
+// touches a server that is still listed, so one removed while it waited stays
+// removed.
+
+export const setMcpAwaitingSignIn = (
+  mcps: IMcp[],
+  name: string,
+  url: string
+): IMcp[] =>
+  mcps.map(
+    (mcp): IMcp =>
+      mcp.name === name
+        ? { ...mcp, status: 'connecting', authorizationUrl: url }
+        : mcp
+  );
+
+export const setMcpConnected = (mcps: IMcp[], connected: IMcpPayload): IMcp[] =>
+  mcps.map(
+    (mcp): IMcp =>
+      mcp.name === connected.name
+        ? {
+            ...mcp,
+            status: 'connected',
+            tools: connected.tools,
+            authorizationUrl: undefined
+          }
+        : mcp
+  );
+
+export const setMcpFailed = (mcps: IMcp[], name: string): IMcp[] =>
+  mcps.map(
+    (mcp): IMcp =>
+      mcp.name === name
+        ? { ...mcp, status: 'failed', authorizationUrl: undefined }
+        : mcp
+  );
