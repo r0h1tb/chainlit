@@ -2754,7 +2754,7 @@ class TestConnectMcpOAuth:
             "mcp_authorization_required", {"name": "jira", "url": authorize_url}
         )
 
-    def test_the_connect_budget_covers_the_authorization_and_is_then_released(
+    def test_a_connect_that_needs_sign_in_returns_before_the_user_signs_in(
         self,
         test_client: TestClient,
         test_config,
@@ -2762,20 +2762,18 @@ class TestConnectMcpOAuth:
         oauth_user,
         monkeypatch: pytest.MonkeyPatch,
     ):
+        """Holding POST /mcp open across the browser round-trip is fragile
+        behind proxies, so it returns as soon as the user is sent to sign in."""
         from chainlit.config import McpServerOAuth
-        from chainlit.mcp_oauth import pending_authorizations
 
-        monkeypatch.setattr("chainlit.mcp._MCP_CONNECT_TIMEOUT_HTTP", 0.05)
-        monkeypatch.setattr("chainlit.mcp_oauth.AUTHORIZATION_TIMEOUT", 0.3)
-        # Near-instant teardown, so the elapsed time measures the connect budget.
-        monkeypatch.setattr("chainlit.session._CLOSE_TIMEOUT", 0.01)
+        monkeypatch.setattr("chainlit.mcp._MCP_CONNECT_TIMEOUT_HTTP", 5.0)
+        monkeypatch.setattr("chainlit.mcp_oauth.AUTHORIZATION_TIMEOUT", 5.0)
+        authorize_url = "https://mcp.example.com/authorize?state=pending-state"
 
         @asynccontextmanager
         async def waiting_transport(url, headers=None, auth=None, **kwargs):
-            await auth.context.redirect_handler(
-                "https://mcp.example.com/authorize?state=never-completed"
-            )
-            await auth.context.callback_handler()  # the user never comes back
+            await auth.context.redirect_handler(authorize_url)
+            await auth.context.callback_handler()
             yield (AsyncMock(), AsyncMock(), AsyncMock())
 
         monkeypatch.setattr(
@@ -2789,14 +2787,21 @@ class TestConnectMcpOAuth:
             json={"sessionId": mcp_session_get_by_id_patched.id, "name": "jira"},
         )
 
-        assert response.status_code == 400
-        # The HTTP budget alone is 0.05s; the wait also covered the consent.
-        assert time.monotonic() - started >= 0.3
-        # The abandoned flow was dropped, so a late callback is refused.
-        with pytest.raises(KeyError):
-            pending_authorizations.resolve(
-                "never-completed", oauth_user.identifier, "late-code"
-            )
+        assert response.status_code == 202, response.text
+        assert time.monotonic() - started < 5
+        assert response.json() == {
+            "status": "authorization_required",
+            "url": authorize_url,
+            "mcp": {
+                "name": "jira",
+                "tools": [],
+                "isUserProvided": False,
+                "url": None,
+                "headers": None,
+                "type": "streamable-http",
+            },
+        }
+        assert "jira" not in mcp_session_get_by_id_patched.mcp_sessions
 
     def test_a_connect_that_never_redirects_keeps_the_ordinary_budget(
         self,
@@ -2834,3 +2839,225 @@ class TestConnectMcpOAuth:
         assert response.status_code == 400
         assert time.monotonic() - started < 2
         mcp_session_get_by_id_patched.emit.assert_not_awaited()
+
+
+async def _wait_for_background_connects(timeout: float = 3.0) -> None:
+    from chainlit.server import _mcp_connects_awaiting_authorization
+
+    deadline = time.monotonic() + timeout
+    while _mcp_connects_awaiting_authorization:
+        assert time.monotonic() < deadline, "the background connect never finished"
+        await asyncio.sleep(0.01)
+
+
+def _emitted(emit: AsyncMock, event: str) -> list:
+    return [c.args[1] for c in emit.await_args_list if c.args[0] == event]
+
+
+class TestConnectMcpOAuthInBackground:
+    """After POST /mcp returns 202, the connection finishes in the background
+    and reports over the socket. These run on the test's own event loop, which
+    keeps that background work alive after the response."""
+
+    @pytest.fixture(autouse=True)
+    def _fast_task_teardown(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr("chainlit.session._CLOSE_TIMEOUT", 0.5)
+
+    @pytest.fixture(autouse=True)
+    def _fresh_oauth_state(self):
+        from chainlit.mcp_oauth import pending_authorizations
+
+        pending_authorizations._pending.clear()
+        yield
+        pending_authorizations._pending.clear()
+
+    @staticmethod
+    async def _start_connect(app, session_id: str) -> httpx.Response:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            return await client.post(
+                "/mcp", json={"sessionId": session_id, "name": "jira"}
+            )
+
+    @staticmethod
+    def _transport_waiting_for_sign_in(state: str):
+        @asynccontextmanager
+        async def transport(url, headers=None, auth=None, **kwargs):
+            await auth.context.redirect_handler(
+                f"https://mcp.example.com/authorize?state={state}"
+            )
+            try:
+                await auth.context.callback_handler()
+            except Exception:
+                # Swallowed, as the SDK's send loop does; the failure reaches
+                # connect_mcp through on_failure instead.
+                await asyncio.Event().wait()
+            yield (AsyncMock(), AsyncMock(), AsyncMock())
+
+        return transport
+
+    @pytest.mark.asyncio
+    async def test_the_connection_is_reported_once_the_user_signs_in(
+        self,
+        mcp_chainlit_app,
+        test_config,
+        mcp_session_get_by_id_patched: Mock,
+        oauth_user,
+        mock_mcp_transport,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from chainlit.config import McpServerOAuth
+        from chainlit.mcp_oauth import pending_authorizations
+
+        monkeypatch.setattr(
+            "mcp.client.streamable_http.streamablehttp_client",
+            self._transport_waiting_for_sign_in("consent-state"),
+        )
+        _configure_http_server(test_config, oauth=McpServerOAuth())
+
+        response = await self._start_connect(
+            mcp_chainlit_app, mcp_session_get_by_id_patched.id
+        )
+        assert response.status_code == 202, response.text
+
+        pending_authorizations.resolve(
+            "consent-state", oauth_user.identifier, "the-code"
+        )
+        await _wait_for_background_connects()
+
+        emit = mcp_session_get_by_id_patched.emit
+        assert _emitted(emit, "mcp_connected") == [
+            {
+                "mcp": {
+                    "name": "jira",
+                    "tools": [{"name": "dummy_tool"}],
+                    "isUserProvided": False,
+                    "url": None,
+                    "headers": None,
+                    "type": "streamable-http",
+                }
+            }
+        ]
+        assert _emitted(emit, "mcp_connection_failed") == []
+        stored = mcp_session_get_by_id_patched.mcp_sessions.pop("jira")
+        await stored.close()
+
+    @pytest.mark.asyncio
+    async def test_a_refused_sign_in_is_reported_on_the_socket(
+        self,
+        mcp_chainlit_app,
+        test_config,
+        mcp_session_get_by_id_patched: Mock,
+        oauth_user,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from chainlit.config import McpServerOAuth
+        from chainlit.mcp_oauth import pending_authorizations
+
+        monkeypatch.setattr(
+            "mcp.client.streamable_http.streamablehttp_client",
+            self._transport_waiting_for_sign_in("refused-state"),
+        )
+        _configure_http_server(test_config, oauth=McpServerOAuth())
+
+        response = await self._start_connect(
+            mcp_chainlit_app, mcp_session_get_by_id_patched.id
+        )
+        assert response.status_code == 202, response.text
+
+        pending_authorizations.abandon(
+            "refused-state",
+            oauth_user.identifier,
+            reason="The authorization server returned an error: access_denied",
+        )
+        await _wait_for_background_connects()
+
+        emit = mcp_session_get_by_id_patched.emit
+        assert _emitted(emit, "mcp_connection_failed") == [
+            {
+                "name": "jira",
+                "detail": (
+                    "Could not connect to the MCP server. Check the server logs "
+                    "for details."
+                ),
+            }
+        ]
+        assert _emitted(emit, "mcp_connected") == []
+        assert "jira" not in mcp_session_get_by_id_patched.mcp_sessions
+
+    @pytest.mark.asyncio
+    async def test_a_sign_in_that_never_finishes_fails_after_its_window(
+        self,
+        mcp_chainlit_app,
+        test_config,
+        mcp_session_get_by_id_patched: Mock,
+        oauth_user,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from chainlit.config import McpServerOAuth
+        from chainlit.mcp_oauth import pending_authorizations
+
+        monkeypatch.setattr("chainlit.mcp._MCP_CONNECT_TIMEOUT_HTTP", 0.05)
+        monkeypatch.setattr("chainlit.mcp_oauth.AUTHORIZATION_TIMEOUT", 0.3)
+        monkeypatch.setattr("chainlit.session._CLOSE_TIMEOUT", 0.01)
+        monkeypatch.setattr(
+            "mcp.client.streamable_http.streamablehttp_client",
+            self._transport_waiting_for_sign_in("never-completed"),
+        )
+        _configure_http_server(test_config, oauth=McpServerOAuth())
+
+        started = time.monotonic()
+        response = await self._start_connect(
+            mcp_chainlit_app, mcp_session_get_by_id_patched.id
+        )
+        assert response.status_code == 202, response.text
+        await _wait_for_background_connects()
+
+        # The user got the whole authorization window before it failed.
+        assert time.monotonic() - started >= 0.3
+        assert [
+            e["name"]
+            for e in _emitted(
+                mcp_session_get_by_id_patched.emit, "mcp_connection_failed"
+            )
+        ] == ["jira"]
+        # The abandoned flow was dropped, so a late callback is refused.
+        with pytest.raises(KeyError):
+            pending_authorizations.resolve(
+                "never-completed", oauth_user.identifier, "late-code"
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_connection_finished_after_the_session_closed_is_dropped(
+        self,
+        mcp_chainlit_app,
+        test_config,
+        mcp_session_get_by_id_patched: Mock,
+        oauth_user,
+        mock_mcp_transport,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from chainlit.config import McpServerOAuth
+        from chainlit.mcp_oauth import pending_authorizations
+
+        monkeypatch.setattr(
+            "mcp.client.streamable_http.streamablehttp_client",
+            self._transport_waiting_for_sign_in("late-state"),
+        )
+        _configure_http_server(test_config, oauth=McpServerOAuth())
+
+        response = await self._start_connect(
+            mcp_chainlit_app, mcp_session_get_by_id_patched.id
+        )
+        assert response.status_code == 202, response.text
+
+        # The user closed the tab while signing in.
+        monkeypatch.setattr(
+            "chainlit.session.WebsocketSession.get_by_id", lambda session_id: None
+        )
+        pending_authorizations.resolve("late-state", oauth_user.identifier, "code")
+        await _wait_for_background_connects()
+
+        assert _emitted(mcp_session_get_by_id_patched.emit, "mcp_connected") == []
+        assert "jira" not in mcp_session_get_by_id_patched.mcp_sessions

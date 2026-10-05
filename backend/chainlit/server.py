@@ -1471,6 +1471,23 @@ def _unwrap_mcp_error(exc: BaseException) -> BaseException:
     return current
 
 
+async def _wait_for_any(events: List[asyncio.Event], timeout: float) -> None:
+    """Return once any of ``events`` is set, or after ``timeout`` seconds."""
+    waiters = [asyncio.ensure_future(event.wait()) for event in events]
+    try:
+        await asyncio.wait(
+            waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+        )
+    finally:
+        for waiter in waiters:
+            waiter.cancel()
+
+
+# Connections handed to the background while the user signs in. asyncio keeps
+# only weak references to tasks, so these hold them until they finish.
+_mcp_connects_awaiting_authorization: set[asyncio.Task] = set()
+
+
 @router.post("/mcp")
 async def connect_mcp(
     request: Request,
@@ -1680,9 +1697,10 @@ async def connect_mcp(
 
     ready_event: asyncio.Event = asyncio.Event()
     stop_event: asyncio.Event = asyncio.Event()
-    # Set once the user has been sent to authorize in the browser — only
-    # then does the connect wait stretch to cover their sign-in and consent.
+    # Set once the user has been sent to authorize in the browser. The request
+    # then returns, and the connection finishes in the background.
     authorization_requested: asyncio.Event = asyncio.Event()
+    authorization_url: dict[str, str] = {}
     # Mutable container to pass the ClientSession (or an error) back from
     # the bg task.
     result_holder: dict[str, object] = {}
@@ -1723,6 +1741,7 @@ async def connect_mcp(
             )
 
         async def _emit_authorization_url(auth_url: str) -> None:
+            authorization_url["url"] = auth_url
             await context.emitter.emit(
                 "mcp_authorization_required",
                 {"name": payload.name, "url": auth_url},
@@ -1881,41 +1900,55 @@ async def connect_mcp(
         if isinstance(mcp_connection, StdioMcpConnection)
         else _MCP_CONNECT_TIMEOUT_HTTP
     )
-    try:
-        await asyncio.wait_for(ready_event.wait(), timeout=connect_timeout)
-    except asyncio.TimeoutError:
-        if authorization_requested.is_set():
-            # The user was sent to sign in and consent in the browser, which
-            # gets a window of its own. A cached or refreshed token never gets
-            # here, so a server that is simply down still fails on the HTTP
-            # budget rather than after the authorization window.
-            connect_timeout += AUTHORIZATION_TIMEOUT
-            try:
-                await asyncio.wait_for(
-                    ready_event.wait(), timeout=AUTHORIZATION_TIMEOUT
-                )
-            except asyncio.TimeoutError:
-                pass
-    if "error" not in result_holder and "client" not in result_holder:
-        result_holder["error"] = asyncio.TimeoutError(
-            f"Timed out after {connect_timeout:.0f}s waiting for the MCP "
-            "connection to initialize."
-        )
 
-    if "error" in result_holder:
-        # Always route through stop_mcp_task rather than a bare ``await
-        # task`` — the discriminator is "is the task done", not "did the
-        # wait raise": on the timeout/blocked paths the runner may still be
-        # sitting inside ``initialize()``, and stop_mcp_task's bounded
-        # wait-then-cancel unsticks that (and closes a latent unbounded
-        # hang if ``exit_stack.aclose()`` itself stalls).
-        await stop_mcp_task(task, stop_event, payload.name)
-        connect_error = cast(BaseException, result_holder["error"])
+    def _mcp_payload(tools: List[Dict[str, str]]) -> Dict[str, object]:
+        # `type` (named servers) vs `clientType` (user-provided) — IMcp in
+        # libs/react-client/src/types/mcp.ts declares both as optional, not
+        # nullable, so the field that doesn't apply is omitted rather than sent
+        # as null.
+        mcp_payload: Dict[str, object] = {
+            "name": mcp_connection.name,
+            "tools": tools,
+            "isUserProvided": is_user_provided,
+            # Only echo url/headers back for user-provided servers — the client
+            # already sent those. For named servers they come from the
+            # developer's config (may contain secrets) and must not leak.
+            "url": getattr(mcp_connection, "url", None) if is_user_provided else None,
+            "headers": getattr(mcp_connection, "headers", None)
+            if is_user_provided
+            else None,
+        }
         if is_user_provided:
-            # The client already supplied this URL, so echoing the failure
-            # detail back is useful and leaks nothing new.
-            detail = f"Could not connect to the MCP: {connect_error!s}"
+            mcp_payload["clientType"] = mcp_connection.clientType
         else:
+            mcp_payload["type"] = mcp_connection.clientType
+        return mcp_payload
+
+    async def _complete_connection(budget: float) -> Union[Dict[str, object], str]:
+        """Finish a connection whose wait is over.
+
+        Returns the MCP payload for the client, or the error detail to show
+        once the connection has been torn down.
+        """
+        if "error" not in result_holder and "client" not in result_holder:
+            result_holder["error"] = asyncio.TimeoutError(
+                f"Timed out after {budget:.0f}s waiting for the MCP "
+                "connection to initialize."
+            )
+
+        if "error" in result_holder:
+            # Always route through stop_mcp_task rather than a bare ``await
+            # task`` — the discriminator is "is the task done", not "did the
+            # wait raise": on the timeout/blocked paths the runner may still be
+            # sitting inside ``initialize()``, and stop_mcp_task's bounded
+            # wait-then-cancel unsticks that (and closes a latent unbounded
+            # hang if ``exit_stack.aclose()`` itself stalls).
+            await stop_mcp_task(task, stop_event, payload.name)
+            connect_error = cast(BaseException, result_holder["error"])
+            if is_user_provided:
+                # The client already supplied this URL, so echoing the failure
+                # detail back is useful and leaks nothing new.
+                return f"Could not connect to the MCP: {connect_error!s}"
             # Named servers are developer config and may embed secrets in
             # userinfo or query params — httpx errors routinely include the
             # request URL in their string form, so never return it verbatim.
@@ -1924,120 +1957,146 @@ async def connect_mcp(
                 payload.name,
                 exc_info=connect_error,
             )
-            detail = (
+            return (
                 "Could not connect to the MCP server. Check the server logs "
                 "for details."
             )
-        return JSONResponse(
-            status_code=400,
-            content={"detail": detail},
-        )
 
-    mcp_client_session = cast("ClientSession", result_holder["client"])
+        mcp_client_session = cast("ClientSession", result_holder["client"])
 
-    # Call the user callback
-    if config.code.on_mcp_connect:
-        try:
-            await config.code.on_mcp_connect(mcp_connection, mcp_client_session)
-        except Exception as e:
-            # Callback failed — tear down the connection.
-            await stop_mcp_task(task, stop_event, payload.name)
-            if is_user_provided:
-                detail = f"Could not connect to the MCP: {e!s}"
-            else:
+        # Call the user callback
+        if config.code.on_mcp_connect:
+            try:
+                await config.code.on_mcp_connect(mcp_connection, mcp_client_session)
+            except Exception as e:
+                # Callback failed — tear down the connection.
+                await stop_mcp_task(task, stop_event, payload.name)
+                if is_user_provided:
+                    return f"Could not connect to the MCP: {e!s}"
                 logger.error(
                     "on_mcp_connect callback failed for MCP server %r",
                     payload.name,
                     exc_info=e,
                 )
-                detail = (
+                return (
                     "Could not connect to the MCP server. Check the server "
                     "logs for details."
                 )
-            return JSONResponse(
-                status_code=400,
-                content={"detail": detail},
-            )
 
-    # Disconnect previous session for this name (reconnection). Runs only
-    # now that on_mcp_connect has succeeded — a reconnect that failed for
-    # any reason above (bad creds, server down, blocked destination,
-    # timeout, a rejecting callback) leaves the old working session intact
-    # instead of evicting it before knowing the replacement would work.
-    # Trade-off: if the old session was already silently dead, it keeps
-    # showing "connected" until this succeeds — pre-existing (McpSession has
-    # no liveness probe), not made worse here.
-    #
-    # The check-then-store step itself must be atomic: two concurrent
-    # reconnects for the same name can both reach here around the same
-    # time, and if the dict pop and the dict store are separated by an
-    # `await` (as they used to be -- on_mcp_disconnect / old session close
-    # sat in between), a second request can see the name already popped by
-    # the first, skip eviction, and store its own session -- only for the
-    # first request to then resume and unconditionally overwrite it,
-    # orphaning the second session's background task forever (never
-    # reachable from mcp_sessions again, so even WebsocketSession.delete()
-    # can't close it). swap_mcp_session does the pop+store as a single
-    # `await`-free step, so no other coroutine can ever observe (or act on)
-    # an in-between state where the name is briefly absent -- it's atomic
-    # under asyncio's cooperative scheduling, no lock needed. Whichever
-    # request's swap runs second simply evicts the first request's
-    # just-stored session the same way it would evict any other stale one,
-    # so a task is always torn down through the normal path below and never
-    # silently dropped.
-    mcp_session_obj = McpSession(
-        name=mcp_connection.name,
-        client=mcp_client_session,
-        task=task,
-        stop_event=stop_event,
-    )
-    old_mcp = session.swap_mcp_session(mcp_connection.name, mcp_session_obj)
-    if old_mcp is not None:
-        if on_mcp_disconnect := config.code.on_mcp_disconnect:
+        # Disconnect previous session for this name (reconnection). Runs only
+        # now that on_mcp_connect has succeeded — a reconnect that failed for
+        # any reason above (bad creds, server down, blocked destination,
+        # timeout, a rejecting callback) leaves the old working session intact
+        # instead of evicting it before knowing the replacement would work.
+        # Trade-off: if the old session was already silently dead, it keeps
+        # showing "connected" until this succeeds — pre-existing (McpSession has
+        # no liveness probe), not made worse here.
+        #
+        # The check-then-store step itself must be atomic: two concurrent
+        # reconnects for the same name can both reach here around the same
+        # time, and if the dict pop and the dict store are separated by an
+        # `await` (as they used to be -- on_mcp_disconnect / old session close
+        # sat in between), a second request can see the name already popped by
+        # the first, skip eviction, and store its own session -- only for the
+        # first request to then resume and unconditionally overwrite it,
+        # orphaning the second session's background task forever (never
+        # reachable from mcp_sessions again, so even WebsocketSession.delete()
+        # can't close it). swap_mcp_session does the pop+store as a single
+        # `await`-free step, so no other coroutine can ever observe (or act on)
+        # an in-between state where the name is briefly absent -- it's atomic
+        # under asyncio's cooperative scheduling, no lock needed. Whichever
+        # request's swap runs second simply evicts the first request's
+        # just-stored session the same way it would evict any other stale one,
+        # so a task is always torn down through the normal path below and never
+        # silently dropped.
+        mcp_session_obj = McpSession(
+            name=mcp_connection.name,
+            client=mcp_client_session,
+            task=task,
+            stop_event=stop_event,
+        )
+        old_mcp = session.swap_mcp_session(mcp_connection.name, mcp_session_obj)
+        if old_mcp is not None:
+            if on_mcp_disconnect := config.code.on_mcp_disconnect:
+                try:
+                    await on_mcp_disconnect(payload.name, old_mcp.client)
+                except Exception:
+                    logger.debug(
+                        "Error in on_mcp_disconnect callback for %s",
+                        payload.name,
+                        exc_info=True,
+                    )
             try:
-                await on_mcp_disconnect(payload.name, old_mcp.client)
+                await old_mcp.close()
             except Exception:
                 logger.debug(
-                    "Error in on_mcp_disconnect callback for %s",
-                    payload.name,
-                    exc_info=True,
+                    "Error closing old MCP session %s", payload.name, exc_info=True
                 )
+
+        tool_list = await mcp_client_session.list_tools()
+        return _mcp_payload([{"name": t.name} for t in tool_list.tools])
+
+    async def _finish_after_authorization() -> None:
+        # The user gets the whole authorization window, and the connection
+        # its ordinary budget on top of it.
+        budget = connect_timeout + AUTHORIZATION_TIMEOUT
         try:
-            await old_mcp.close()
+            await asyncio.wait_for(ready_event.wait(), timeout=budget)
+        except asyncio.TimeoutError:
+            pass
+        if WebsocketSession.get_by_id(session.id) is not session:
+            # The session closed while the user was signing in, so there is
+            # nothing left to attach the connection to.
+            await stop_mcp_task(task, stop_event, payload.name)
+            return
+        try:
+            outcome = await _complete_connection(budget)
+        except Exception:
+            # Nobody is waiting on a response to raise into, so report it.
+            logger.exception("Failed to finish MCP connection %r", payload.name)
+            outcome = (
+                "Could not connect to the MCP server. Check the server logs "
+                "for details."
+            )
+        try:
+            if isinstance(outcome, str):
+                await context.emitter.emit(
+                    "mcp_connection_failed", {"name": payload.name, "detail": outcome}
+                )
+            else:
+                await context.emitter.emit("mcp_connected", {"mcp": outcome})
         except Exception:
             logger.debug(
-                "Error closing old MCP session %s", payload.name, exc_info=True
+                "Could not send the MCP connection result for %r",
+                payload.name,
+                exc_info=True,
             )
 
-    tool_list = await mcp_client_session.list_tools()
+    await _wait_for_any([ready_event, authorization_requested], connect_timeout)
 
-    # `type` (named servers) vs `clientType` (user-provided) — IMcp in
-    # libs/react-client/src/types/mcp.ts declares both as optional, not
-    # nullable, so the field that doesn't apply is omitted rather than sent
-    # as null.
-    mcp_payload: Dict[str, object] = {
-        "name": mcp_connection.name,
-        "tools": [{"name": t.name} for t in tool_list.tools],
-        "isUserProvided": is_user_provided,
-        # Only echo url/headers back for user-provided servers — the client
-        # already sent those. For named servers they come from the
-        # developer's config (may contain secrets) and must not leak.
-        "url": getattr(mcp_connection, "url", None) if is_user_provided else None,
-        "headers": getattr(mcp_connection, "headers", None)
-        if is_user_provided
-        else None,
-    }
-    if is_user_provided:
-        mcp_payload["clientType"] = mcp_connection.clientType
-    else:
-        mcp_payload["type"] = mcp_connection.clientType
+    if authorization_requested.is_set() and not ready_event.is_set():
+        # The user has been sent to sign in. Holding this request open across
+        # that browser round-trip is fragile behind proxies and load balancers,
+        # so return now and report the result over the socket instead, as
+        # `mcp_connected` or `mcp_connection_failed`.
+        finish = asyncio.create_task(
+            _finish_after_authorization(), name=f"mcp-authorize-{payload.name}"
+        )
+        _mcp_connects_awaiting_authorization.add(finish)
+        finish.add_done_callback(_mcp_connects_awaiting_authorization.discard)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "authorization_required",
+                "url": authorization_url["url"],
+                "mcp": _mcp_payload([]),
+            },
+        )
 
-    return JSONResponse(
-        content={
-            "success": True,
-            "mcp": mcp_payload,
-        }
-    )
+    outcome = await _complete_connection(connect_timeout)
+    if isinstance(outcome, str):
+        return JSONResponse(status_code=400, content={"detail": outcome})
+    return JSONResponse(content={"success": True, "mcp": outcome})
 
 
 @router.delete("/mcp")
