@@ -12,4 +12,18 @@ export interface IMcp {
   // opposed to a named (developer-configured) server. Do not infer this
   // from the presence of 'url' or 'clientType'.
   isUserProvided?: boolean;
+  // A user-provided server that signs the user in with OAuth. Named servers
+  // turn OAuth on in the app's config instead.
+  useOAuth?: boolean;
+  // Set while the connection waits for the user to sign in at this URL.
+  authorizationUrl?: string;
+}
+
+// POST /mcp answers with this when the user has to sign in before the
+// connection can finish. The outcome then arrives over the socket as
+// `mcp_connected` or `mcp_connection_failed`.
+export interface IMcpAuthorizationRequired {
+  status: 'authorization_required';
+  url: string;
+  mcp: IMcp;
 }

@@ -8,6 +8,7 @@ import {
   ChainlitContext,
   IMcp,
   mcpState,
+  openMcpAuthorizationUrl,
   sessionIdState
 } from '@chainlit/react-client';
 
@@ -89,6 +90,9 @@ interface McpItemProps {
 }
 
 const McpItem = ({ mcp, onDelete, isLoading }: McpItemProps) => {
+  const authorizationUrl =
+    mcp.status === 'connecting' ? mcp.authorizationUrl : undefined;
+
   return (
     <div className="border rounded-lg p-4 flex flex-col gap-3">
       <div className="flex justify-between items-center">
@@ -105,6 +109,16 @@ const McpItem = ({ mcp, onDelete, isLoading }: McpItemProps) => {
           <Badge variant="outline">{mcp.type ?? mcp.clientType}</Badge>
         </div>
         <div className="flex items-center">
+          {authorizationUrl && (
+            <Button
+              variant="outline"
+              size="sm"
+              className="mr-1"
+              onClick={() => openMcpAuthorizationUrl(authorizationUrl)}
+            >
+              Sign in
+            </Button>
+          )}
           <ReconnectMcpButton mcp={mcp} />
           <DeleteMcpButton mcp={mcp} onDelete={onDelete} disabled={isLoading} />
         </div>
@@ -221,6 +235,24 @@ const ReconnectMcpButton = ({ mcp }: { mcp: IMcp }) => {
       })
     );
 
+    // Returns what the toast reports: the server may first send the user to
+    // sign in, and the outcome then arrives over the socket.
+    const applyResponse = (resp: any) => {
+      if (resp.status === 'authorization_required') {
+        setMcps((prev) =>
+          prev.map((existingMcp) =>
+            existingMcp.name === mcp.name
+              ? { ...existingMcp, authorizationUrl: resp.url }
+              : existingMcp
+          )
+        );
+        return 'Waiting for you to sign in...';
+      }
+      const { success, mcp: updatedMcp } = resp;
+      updateMcpStatus(success, updatedMcp);
+      return 'MCP reconnected!';
+    };
+
     const updateMcpStatus = (success: boolean, updatedMcp?: any) => {
       setMcps((prev) =>
         prev.map((existingMcp) => {
@@ -245,19 +277,18 @@ const ReconnectMcpButton = ({ mcp }: { mcp: IMcp }) => {
             mcp.name,
             mcp.clientType,
             mcp.url,
-            mcp.headers
+            mcp.headers,
+            mcp.useOAuth
           )
-          .then(async (resp: any) => {
-            const { success, mcp: updatedMcp } = resp;
-            updateMcpStatus(success, updatedMcp);
-          })
-          .catch(() => {
+          .then(applyResponse)
+          .catch((err) => {
             updateMcpStatus(false);
+            throw err;
           })
           .finally(() => setIsLoading(false)),
         {
           loading: 'Reconnecting MCP...',
-          success: () => 'MCP reconnected!',
+          success: (message: string) => message,
           error: (err) => <span>{err.message}</span>
         }
       );
@@ -266,17 +297,15 @@ const ReconnectMcpButton = ({ mcp }: { mcp: IMcp }) => {
       toast.promise(
         apiClient
           .connectMcp(sessionId, mcp.name)
-          .then(async (resp: any) => {
-            const { success, mcp: updatedMcp } = resp;
-            updateMcpStatus(success, updatedMcp);
-          })
-          .catch(() => {
+          .then(applyResponse)
+          .catch((err) => {
             updateMcpStatus(false);
+            throw err;
           })
           .finally(() => setIsLoading(false)),
         {
           loading: 'Reconnecting MCP...',
-          success: () => 'MCP reconnected!',
+          success: (message: string) => message,
           error: (err) => <span>{err.message}</span>
         }
       );

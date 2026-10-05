@@ -40,12 +40,14 @@ import {
   IAction,
   ICommand,
   IElement,
+  IMcp,
   IMessageElement,
   IMode,
   IStep,
   ITasklistElement,
   IThread
 } from 'src/types';
+import { openMcpAuthorizationUrl } from 'src/utils/mcp';
 import {
   addMessage,
   deleteMessageById,
@@ -153,14 +155,22 @@ const useChatSession = () => {
                 mcp.name,
                 mcp.clientType,
                 mcp.url,
-                mcp.headers
+                mcp.headers,
+                mcp.useOAuth
               );
             } else {
               // Named (developer-configured) MCP
               promise = client.connectMcp(sessionId, mcp.name);
             }
             promise
-              .then(async ({ success, mcp }) => {
+              .then(async (resp) => {
+                if (resp.status === 'authorization_required') {
+                  // The user is asked to sign in (mcp_authorization_required),
+                  // and the outcome arrives as mcp_connected or
+                  // mcp_connection_failed.
+                  return;
+                }
+                const { success, mcp } = resp;
                 setMcps((prev) =>
                   prev.map((existingMcp) => {
                     if (existingMcp.name === mcp.name) {
@@ -195,6 +205,59 @@ const useChatSession = () => {
       socket.on('connect_error', (_) => {
         setSession((s) => ({ ...s!, error: true }));
       });
+
+      socket.on(
+        'mcp_authorization_required',
+        ({ name, url }: { name: string; url: string }) => {
+          setMcps((prev) =>
+            prev.map((mcp) =>
+              mcp.name === name
+                ? { ...mcp, status: 'connecting', authorizationUrl: url }
+                : mcp
+            )
+          );
+          toast.info(`Sign in to finish connecting ${name}`, {
+            id: `mcp-${name}`,
+            duration: Infinity,
+            action: {
+              label: 'Sign in',
+              onClick: () => openMcpAuthorizationUrl(url)
+            }
+          });
+        }
+      );
+
+      socket.on('mcp_connected', ({ mcp }: { mcp: IMcp }) => {
+        const connected = {
+          status: 'connected' as const,
+          tools: mcp.tools,
+          authorizationUrl: undefined
+        };
+        setMcps((prev) =>
+          prev.some((existingMcp) => existingMcp.name === mcp.name)
+            ? prev.map((existingMcp) =>
+                existingMcp.name === mcp.name
+                  ? { ...existingMcp, ...connected }
+                  : existingMcp
+              )
+            : [...prev, { ...mcp, ...connected }]
+        );
+        toast.success(`${mcp.name} connected`, { id: `mcp-${mcp.name}` });
+      });
+
+      socket.on(
+        'mcp_connection_failed',
+        ({ name, detail }: { name: string; detail: string }) => {
+          setMcps((prev) =>
+            prev.map((mcp) =>
+              mcp.name === name
+                ? { ...mcp, status: 'failed', authorizationUrl: undefined }
+                : mcp
+            )
+          );
+          toast.error(detail, { id: `mcp-${name}` });
+        }
+      );
 
       socket.on('task_start', () => {
         setLoading(true);
