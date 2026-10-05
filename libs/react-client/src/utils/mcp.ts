@@ -27,6 +27,8 @@ export const openMcpAuthorizationUrl = (url: string) => {
 // touches a server that is still listed, so one removed while it waited stays
 // removed.
 
+// Only a server that is still connecting takes the link, so a late response
+// can't send one that already connected or failed back to waiting.
 export const setMcpAwaitingSignIn = (
   mcps: IMcp[],
   name: string,
@@ -34,8 +36,8 @@ export const setMcpAwaitingSignIn = (
 ): IMcp[] =>
   mcps.map(
     (mcp): IMcp =>
-      mcp.name === name
-        ? { ...mcp, status: 'connecting', authorizationUrl: url }
+      mcp.name === name && mcp.status === 'connecting'
+        ? { ...mcp, authorizationUrl: url }
         : mcp
   );
 

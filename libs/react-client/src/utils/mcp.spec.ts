@@ -78,6 +78,17 @@ describe('sign-in state updates', () => {
     );
   });
 
+  it('gives the sign-in link only to a server that is still connecting', () => {
+    const link = 'https://auth.example.com/authorize?state=late';
+    const done: IMcp = { ...waiting, status: 'connected' };
+    delete done.authorizationUrl;
+
+    expect(setMcpAwaitingSignIn([done], 'jira', link)).toEqual([done]);
+    expect(
+      setMcpAwaitingSignIn([waiting], 'jira', link)[0].authorizationUrl
+    ).toBe(link);
+  });
+
   it('marks a failed sign-in failed and drops its link', () => {
     const [mcp] = setMcpFailed([waiting], 'jira');
 
